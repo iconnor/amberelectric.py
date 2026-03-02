@@ -3,6 +3,7 @@ import json
 from dateutil import tz, parser
 from datetime import date
 import pandas as pd
+import numpy as np
 
 from amberelectric.rest import RESTResponse
 from amberelectric.configuration import Configuration
@@ -208,24 +209,135 @@ class AmberApi:
             return parse_intervals(json.loads(response.data.decode("utf-8")))
         else:
             raise ApiException(response.status, response.reason, response)
-        
+       
     def get_usage_dateframe(self, site_id: str, start_date: date, end_date: date, **kwargs):
         response = self.get_usage(site_id, start_date, end_date, **kwargs)
-        df1 = pd.DataFrame([row.to_dict() for row in response])
-        if len(df1) == 0:
-            raise Exception('No data found for site %s' % site_id)
-        timezone = kwargs.get('timezone', 'Australia/Brisbane')
-        df1['nem_time'] = pd.to_datetime(df1['nem_time']).dt.tz_convert(tz.gettz(timezone))
-        df1.index = df1['nem_time']
-        df1.sort_index(inplace=True)
-        feed_in = df1[df1['channel_type'] == ChannelType.FEED_IN]
-        general = df1[df1['channel_type'] == ChannelType.GENERAL]
-        amber_prices = feed_in.copy()
-        # Rename Price to feed_in_tariff
-        amber_prices.rename(columns={'per_kwh': 'feed_in_tariff'}, inplace=True)
-        amber_prices.rename(columns={'kwh': 'feed_in_kwh'}, inplace=True)
-        amber_prices.rename(columns={'cost': 'feed_in_cost'}, inplace=True)
-        amber_prices['general_tariff'] = general['per_kwh']
-        amber_prices['general_kwh'] = general['kwh']
-        amber_prices['general_cost'] = general['cost']
-        return amber_prices
+        df = pd.DataFrame([row.to_dict() for row in response])
+        if df.empty:
+            raise Exception(f"No data found for site {site_id}")
+
+        timezone = kwargs.get("timezone", "Australia/Brisbane")
+
+        # Parse times and convert to local tz
+        df["nem_time"] = pd.to_datetime(df["nem_time"], utc=True).dt.tz_convert(tz.gettz(timezone))
+        df["start_time"] = pd.to_datetime(df["start_time"], utc=True).dt.tz_convert(tz.gettz(timezone))
+        df["end_time"] = pd.to_datetime(df["end_time"], utc=True).dt.tz_convert(tz.gettz(timezone))
+
+        # Deterministic ordering so "first" is stable
+        sort_cols = ["nem_time"]
+        if "channel_identifier" in df.columns:
+            sort_cols.append("channel_identifier")
+        df = df.sort_values(sort_cols)
+
+        # Aggregate one bucket of rows (same nem_time) into one row
+        def _agg_interval(g: pd.DataFrame) -> pd.Series:
+            kwh = g["kwh"].sum(min_count=1)
+            cost = g["cost"].sum(min_count=1)
+
+            tariff = np.nan
+            if pd.notna(kwh) and kwh != 0 and pd.notna(cost):
+                tariff = cost / kwh
+
+            # spot_per_kwh: kwh-weighted average if possible, else first non-null
+            spot = np.nan
+            if "spot_per_kwh" in g.columns:
+                s = g["spot_per_kwh"]
+                if s.notna().any():
+                    w = g["kwh"].abs()
+                    if w.notna().any() and w.sum() != 0:
+                        spot = (s.fillna(0) * w.fillna(0)).sum() / w.fillna(0).sum()
+                    else:
+                        spot = s.dropna().iloc[0]
+
+            def first_non_null(col: str):
+                if col not in g.columns:
+                    return np.nan
+                s = g[col].dropna()
+                return s.iloc[0] if len(s) else np.nan
+
+            return pd.Series(
+                {
+                    "duration": first_non_null("duration"),
+                    "date": first_non_null("date"),
+                    "start_time": first_non_null("start_time"),
+                    "end_time": first_non_null("end_time"),
+                    "renewables": first_non_null("renewables"),
+                    "quality": first_non_null("quality"),
+                    "spike_status": first_non_null("spike_status"),
+                    "descriptor": first_non_null("descriptor"),
+                    "range": first_non_null("range"),
+                    "tariff_information": first_non_null("tariff_information"),
+                    "kwh": kwh,
+                    "cost": cost,
+                    "tariff": tariff,
+                    "spot_per_kwh": spot,
+                }
+            )
+
+        # Build three import buckets and one export bucket
+        feed_in = df[df["channel_type"] == ChannelType.FEED_IN].copy()
+        general = df[df["channel_type"] == ChannelType.GENERAL].copy()
+        controlled = df[df["channel_type"] == ChannelType.CONTROLLED_LOAD].copy()
+
+        feed_agg = feed_in.groupby("nem_time", as_index=True).apply(_agg_interval)
+        gen_agg = general.groupby("nem_time", as_index=True).apply(_agg_interval)
+        ctl_agg = controlled.groupby("nem_time", as_index=True).apply(_agg_interval)
+
+        # Rename value columns
+        meta_cols = [
+            "duration",
+            "date",
+            "start_time",
+            "end_time",
+            "renewables",
+            "quality",
+            "spike_status",
+            "descriptor",
+            "range",
+            "tariff_information",
+            "spot_per_kwh",
+        ]
+
+        feed_agg = feed_agg.rename(
+            columns={"kwh": "feed_in_kwh", "cost": "feed_in_cost", "tariff": "feed_in_tariff"}
+        )
+        gen_agg = gen_agg.rename(
+            columns={"kwh": "general_kwh", "cost": "general_cost", "tariff": "general_tariff"}
+        )
+        ctl_agg = ctl_agg.rename(
+            columns={
+                "kwh": "controlled_load_kwh",
+                "cost": "controlled_load_cost",
+                "tariff": "controlled_load_tariff",
+            }
+        )
+
+        # Assemble metadata from whichever bucket has it (prefer general, then controlled, then feed_in)
+        meta = gen_agg[meta_cols].combine_first(ctl_agg[meta_cols]).combine_first(feed_agg[meta_cols])
+
+        # Assemble values
+        out = meta.join(
+            feed_agg.drop(columns=meta_cols, errors="ignore"),
+            how="outer",
+        ).join(
+            gen_agg.drop(columns=meta_cols, errors="ignore"),
+            how="outer",
+        ).join(
+            ctl_agg.drop(columns=meta_cols, errors="ignore"),
+            how="outer",
+        ).sort_index()
+
+        # Import total columns (GENERAL + CONTROLLED_LOAD)
+        out["import_kwh"] = out["general_kwh"].fillna(0) + out["controlled_load_kwh"].fillna(0)
+        out["import_cost"] = out["general_cost"].fillna(0) + out["controlled_load_cost"].fillna(0)
+        out["import_tariff"] = np.where(
+            out["import_kwh"] != 0,
+            out["import_cost"] / out["import_kwh"],
+            np.nan,
+        )
+
+        # If you prefer NaN (instead of 0) when both components are missing:
+        both_missing = out["general_kwh"].isna() & out["controlled_load_kwh"].isna()
+        out.loc[both_missing, ["import_kwh", "import_cost", "import_tariff"]] = np.nan
+
+        return out
