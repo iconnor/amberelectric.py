@@ -335,8 +335,12 @@ class AmberApi:
         out = out.sort_index()
 
         # Import total columns (GENERAL + CONTROLLED_LOAD)
-        out["import_kwh"] = out["general_kwh"].fillna(0) + out["controlled_load_kwh"].fillna(0)
-        out["import_cost"] = out["general_cost"].fillna(0) + out["controlled_load_cost"].fillna(0)
+        out["import_kwh"] = out["general_kwh"].fillna(0)
+        if not(controlled.empty):
+            out["import_kwh"] = out["import_kwh"] + out["controlled_load_kwh"].fillna(0)
+        out["import_cost"] = out["general_cost"].fillna(0)
+        if not(controlled.empty):
+            out["import_cost"] = out["import_cost"] + out["controlled_load_cost"].fillna(0)
         out["import_tariff"] = np.where(
             out["import_kwh"] != 0,
             out["import_cost"] / out["import_kwh"],
@@ -344,7 +348,8 @@ class AmberApi:
         )
 
         # If you prefer NaN (instead of 0) when both components are missing:
-        both_missing = out["general_kwh"].isna() & out["controlled_load_kwh"].isna()
-        out.loc[both_missing, ["import_kwh", "import_cost", "import_tariff"]] = np.nan
+        if not(controlled.empty):
+            both_missing = out["general_kwh"].isna() & out["controlled_load_kwh"].isna()
+            out.loc[both_missing, ["import_kwh", "import_cost", "import_tariff"]] = np.nan
 
         return out
