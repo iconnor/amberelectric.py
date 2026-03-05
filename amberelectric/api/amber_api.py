@@ -209,7 +209,7 @@ class AmberApi:
             return parse_intervals(json.loads(response.data.decode("utf-8")))
         else:
             raise ApiException(response.status, response.reason, response)
-       
+
     def get_usage_dateframe(self, site_id: str, start_date: date, end_date: date, **kwargs):
         response = self.get_usage(site_id, start_date, end_date, **kwargs)
         df = pd.DataFrame([row.to_dict() for row in response])
@@ -281,7 +281,8 @@ class AmberApi:
 
         feed_agg = feed_in.groupby("nem_time", as_index=True).apply(_agg_interval)
         gen_agg = general.groupby("nem_time", as_index=True).apply(_agg_interval)
-        ctl_agg = controlled.groupby("nem_time", as_index=True).apply(_agg_interval)
+        if not(controlled.empty):
+            ctl_agg = controlled.groupby("nem_time", as_index=True).apply(_agg_interval)
 
         # Rename value columns
         meta_cols = [
@@ -304,16 +305,19 @@ class AmberApi:
         gen_agg = gen_agg.rename(
             columns={"kwh": "general_kwh", "cost": "general_cost", "tariff": "general_tariff"}
         )
-        ctl_agg = ctl_agg.rename(
-            columns={
-                "kwh": "controlled_load_kwh",
-                "cost": "controlled_load_cost",
-                "tariff": "controlled_load_tariff",
-            }
-        )
+        if not(controlled.empty):
+            ctl_agg = ctl_agg.rename(
+                columns={
+                    "kwh": "controlled_load_kwh",
+                    "cost": "controlled_load_cost",
+                    "tariff": "controlled_load_tariff",
+                }
+            )
 
         # Assemble metadata from whichever bucket has it (prefer general, then controlled, then feed_in)
-        meta = gen_agg[meta_cols].combine_first(ctl_agg[meta_cols]).combine_first(feed_agg[meta_cols])
+        meta = gen_agg[meta_cols].combine_first(feed_agg[meta_cols])
+        if not(controlled.empty):
+            meta = meta.combine_first(ctl_agg[meta_cols])
 
         # Assemble values
         out = meta.join(
@@ -322,10 +326,13 @@ class AmberApi:
         ).join(
             gen_agg.drop(columns=meta_cols, errors="ignore"),
             how="outer",
-        ).join(
-            ctl_agg.drop(columns=meta_cols, errors="ignore"),
-            how="outer",
-        ).sort_index()
+        )
+        if not(controlled.empty):
+            out = out.join(
+                ctl_agg.drop(columns=meta_cols, errors="ignore"),
+                how="outer",
+            )
+        out = out.sort_index()
 
         # Import total columns (GENERAL + CONTROLLED_LOAD)
         out["import_kwh"] = out["general_kwh"].fillna(0) + out["controlled_load_kwh"].fillna(0)
