@@ -234,9 +234,17 @@ class AmberApi:
             kwh = g["kwh"].sum(min_count=1)
             cost = g["cost"].sum(min_count=1)
 
+            def first_non_null(col: str):
+                if col not in g.columns:
+                    return np.nan
+                s = g[col].dropna()
+                return s.iloc[0] if len(s) else np.nan
+
             tariff = np.nan
             if pd.notna(kwh) and kwh != 0 and pd.notna(cost):
                 tariff = cost / kwh
+            else:
+                tariff = first_non_null("per_kwh")
 
             # spot_per_kwh: kwh-weighted average if possible, else first non-null
             spot = np.nan
@@ -248,12 +256,6 @@ class AmberApi:
                         spot = (s.fillna(0) * w.fillna(0)).sum() / w.fillna(0).sum()
                     else:
                         spot = s.dropna().iloc[0]
-
-            def first_non_null(col: str):
-                if col not in g.columns:
-                    return np.nan
-                s = g[col].dropna()
-                return s.iloc[0] if len(s) else np.nan
 
             return pd.Series(
                 {
